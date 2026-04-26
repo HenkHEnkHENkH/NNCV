@@ -1,0 +1,201 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+
+class Model(nn.Module):
+    def __init__(self, in_channels=3, n_classes=19):
+        super().__init__()
+
+        # ===== ResNet50 Encoder =====
+        resnet = models.resnet50(weights='DEFAULT')
+
+        self.stem = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu
+        )
+        self.pool = resnet.maxpool
+
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.aspp = ASPP(2048, 512, rates=[1, 6, 12])
+
+        # ===== Decoder =====
+        self.up1 = nn.ConvTranspose2d(512, 256, 2, 2)
+        self.att1 = AttentionGate(256, 1024, 256)
+        self.res1 = ResidualConv(256 + 1024, 256)  
+
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, 2)
+        self.att2 = AttentionGate(128, 512, 128)
+        self.res2 = ResidualConv(128 + 512, 128)   
+
+        self.up3 = nn.ConvTranspose2d(128, 64, 2, 2)
+        self.att3 = AttentionGate(64, 256, 64)
+        self.res3 = ResidualConv(64 + 256, 64)    
+
+        self.up4 = nn.ConvTranspose2d(64, 64, 2, 2)
+        self.att4 = AttentionGate(64, 64, 32)
+        self.res4 = ResidualConv(64 + 64, 64)      
+
+        #self.outc = nn.Conv2d(64, n_classes, 1)
+        self.aux1 = AuxHead(128, n_classes) 
+        self.aux2 = AuxHead(64, n_classes)
+
+        self.seg_head = SegHead(64, n_classes)
+    def forward(self, x):
+        input_size = x.shape[2:]
+
+        # ===== Encoder =====
+        s1 = self.stem(x)
+        s2 = self.layer1(self.pool(s1))
+        s3 = self.layer2(s2)
+        s4 = self.layer3(s3)
+        b  = self.layer4(s4)
+        b = self.aspp(b)  
+        # ===== Decoder =====
+        x = self.up1(b)
+        x = torch.cat([x, self.att1(x, s4)], dim=1)
+        x = self.res1(x)
+
+        x = self.up2(x)
+        x = torch.cat([x, self.att2(x, s3)], dim=1)
+        x = self.res2(x)
+        aux1_out = self.aux1(x)
+
+        x = self.up3(x)
+        x = torch.cat([x, self.att3(x, s2)], dim=1)
+        x = self.res3(x)
+        aux2_out = self.aux2(x)
+
+        x = self.up4(x)
+        x = torch.cat([x, self.att4(x, s1)], dim=1)
+        x = self.res4(x)
+
+        #x = self.outc(x)
+        main_out = self.seg_head(x)
+        main_out = F.interpolate(main_out, size=input_size, mode='bilinear', align_corners=False)
+
+        if self.training:
+            aux1_out = F.interpolate(aux1_out, size=input_size, mode='bilinear', align_corners=False)
+            aux2_out = F.interpolate(aux2_out, size=input_size, mode='bilinear', align_corners=False)
+            return main_out, aux1_out, aux2_out
+        
+        return main_out
+
+class ResidualConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=0.2),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        x = self.conv_block(x)
+        return F.relu(x + residual)
+    
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super().__init__()
+        # W_g: Gating signal (from deeper layer)
+        # W_l: Skip connection (from encoder)
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.W_l = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_l(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        # The 'psi' is a 0 to 1 mask that multiplies the skip connection
+        return x * psi
+    
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels, rates=[6, 12, 18]):
+        super(ASPP, self).__init__()
+        self.stages = nn.ModuleList([
+            # 1x1 convolution
+            nn.Sequential(nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                          nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)),
+            # 3x3 dilated convolutions
+            *[nn.Sequential(nn.Conv2d(in_channels, out_channels, 3, padding=r, dilation=r, bias=False),
+                            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)) for r in rates],
+            # Image Pooling
+            nn.Sequential(nn.AdaptiveAvgPool2d(1),
+                          nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                          nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
+        ])
+        
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(out_channels * (len(rates) + 2), out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1) # Regularization inside the bottleneck
+        )
+
+    def forward(self, x):
+        res = []
+        for stage in self.stages:
+            if isinstance(stage[0], nn.AdaptiveAvgPool2d):
+                # Upsample the image pooling branch back to input size
+                y = stage(x)
+                y = F.interpolate(y, size=x.shape[2:], mode='bilinear', align_corners=True)
+                res.append(y)
+            else:
+                res.append(stage(x))
+        return self.bottleneck(torch.cat(res, dim=1))
+class SegHead(nn.Module):
+    def __init__(self, in_channels, n_classes):
+        super().__init__()
+        self.head = nn.Sequential(
+            # Look at neighboring pixels (3x3)
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # Prevents over-fitting on specific textures (like Nature)
+            nn.Dropout(0.3),
+            # Final projection to class scores (1x1)
+            nn.Conv2d(64, n_classes, kernel_size=1)
+        )
+    def forward(self, x):
+        return self.head(x)
+
+class AuxHead(nn.Module):
+    def __init__(self, in_channels, n_classes):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, n_classes, kernel_size=1)
+        )
+    def forward(self, x):
+        return self.head(x)
