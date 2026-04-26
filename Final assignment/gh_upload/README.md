@@ -1,5 +1,5 @@
 5LSM0 Cityscapes Semantic Segmentation
-This repository contains a robust Attention-U-Net implementation for the Cityscapes dataset, specifically optimized for Domain Generalization from normal urban environments to hard adverse conditions.
+This repository contains a robust Attention-U-Net implementation for the Cityscapes dataset, specifically optimized for Domain Generalization from normal urban environments to hard adverse conditions. traincopy9.py and traincopy_r1.py were used for the best peak performance and best robustness respectively together with modelcopy15.py.
 
 Key Features
 Architecture: ResNeXt-50 backbone with residual attention U-Net decoder.
